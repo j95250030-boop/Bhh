@@ -27,7 +27,7 @@ from telegram.ext import (
 # ════════════════════════════════════════════
 #                   CONFIG
 # ════════════════════════════════════════════
-BOT_TOKEN  = os.environ.get("BOT_TOKEN", "8224195294:AAEyyFVN4hzMOcKSQUov7eJQB3KRkDxBxPM")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "8224195294:AAGVdOt96u8PiZPdZTfL440ZED1wt3-suhA")
 PORT       = int(os.environ.get("PORT", 8080))
 RENDER_URL = (
     os.environ.get("RENDER_EXTERNAL_URL") or
