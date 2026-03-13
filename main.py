@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════╗
 ║     CRYPTO ANALYSIS BOT — CoinGecko API Version         ║
-║     GitHub Actions Compatible | No IP Block!            ║
+║     With TP/SL Alerts + Motivational Notifications!     ║
 ╚══════════════════════════════════════════════════════════╝
 
 requirements.txt:
@@ -19,6 +19,7 @@ Secrets needed:
 
 import os
 import time
+import random
 import logging
 import threading
 import requests
@@ -29,7 +30,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 # ════════════════════════════════════════════════════════
@@ -50,6 +53,31 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ════════════════════════════════════════════════════════
+#           MOTIVATIONAL LINES (Random Select)
+# ════════════════════════════════════════════════════════
+TP_MOTIVATIONS = [
+    "🌟 Markets reward the patient — aap ne sahi waqt ka intezaar kiya!",
+    "💡 Har winning trade ek seekh hai — isse aur bada karo!",
+    "🔥 Yahi toh trading hai — analysis + patience = profit!",
+    "🚀 Aaj ka profit kal ki investment hai — smart raho!",
+    "💎 Diamonds are made under pressure — aur aap ne prove kar diya!",
+    "🎯 Proper target set karna hi asli skill hai — well done!",
+    "⚡ Ek trade ek step — keep climbing to the top!",
+    "🏆 Winners don't quit — aur aap ne prove kar diya!",
+]
+
+SL_MOTIVATIONS = [
+    "💪 Loss ek tuition fee hai — market ne sikhaya, agli baar jeeto!",
+    "🌱 Har girawat ek naya mauka bhi laati hai — ready raho!",
+    "🧠 Smart traders stop loss lagate hain kyunki capital bachana sabse zaroori hai!",
+    "🔄 Ek trade se game khatam nahi hota — plan karo aur wapas aao!",
+    "⚓ Stop loss lagana weakness nahi, yeh discipline hai — proud raho!",
+    "📚 Market ka lesson costly tha, par seekh free mili — use karo!",
+    "🌅 Har raat ke baad subah hoti hai — kal ka market fresh start hai!",
+    "🎯 Professionals apna capital protect karte hain — aap ne sahi kiya!",
+]
+
+# ════════════════════════════════════════════════════════
 #                    FLASK KEEP-ALIVE
 # ════════════════════════════════════════════════════════
 flask_app = Flask(__name__)
@@ -66,14 +94,13 @@ def run_flask():
 # ════════════════════════════════════════════════════════
 #                   SUPPORTED COINS
 # ════════════════════════════════════════════════════════
-# CoinGecko IDs
 COINS = {
     "btc":  "bitcoin",
     "ltc":  "litecoin",
     "sol":  "solana",
     "doge": "dogecoin",
-    "xau":  "METAL",   # gold - metals api
-    "xag":  "METAL",   # silver - metals api
+    "xau":  "METAL",
+    "xag":  "METAL",
 }
 
 EMOJI = {
@@ -87,6 +114,36 @@ EMOJI = {
 
 CRYPTO_COINS = ["btc", "ltc", "sol", "doge"]
 METAL_COINS  = ["xau", "xag"]
+
+# ════════════════════════════════════════════════════════
+#         TP/SL ALERT STORAGE (In-Memory)
+# ════════════════════════════════════════════════════════
+# Structure: alerts[chat_id][coin] = {"tp": price_or_None, "sl": price_or_None}
+alerts: dict = {}
+
+def get_alert(chat_id, coin):
+    return alerts.get(str(chat_id), {}).get(coin, {"tp": None, "sl": None})
+
+def set_alert(chat_id, coin, tp=None, sl=None):
+    cid = str(chat_id)
+    if cid not in alerts:
+        alerts[cid] = {}
+    if coin not in alerts[cid]:
+        alerts[cid][coin] = {"tp": None, "sl": None}
+    if tp is not None:
+        alerts[cid][coin]["tp"] = tp
+    if sl is not None:
+        alerts[cid][coin]["sl"] = sl
+
+def clear_alert_tp(chat_id, coin):
+    cid = str(chat_id)
+    if cid in alerts and coin in alerts[cid]:
+        alerts[cid][coin]["tp"] = None
+
+def clear_alert_sl(chat_id, coin):
+    cid = str(chat_id)
+    if cid in alerts and coin in alerts[cid]:
+        alerts[cid][coin]["sl"] = None
 
 # ════════════════════════════════════════════════════════
 #                     API FUNCTIONS
@@ -134,28 +191,95 @@ def get_ticker(coin):
 
 
 def get_metal_ticker(coin):
-    """Get gold/silver price from metals.live API."""
+    """
+    Get gold/silver price with 3 fallback sources:
+      1. Yahoo Finance (GC=F / SI=F)  — most reliable, real-time
+      2. metals.live                  — fallback
+      3. CoinGecko PAXG/XAUT          — last resort (approx)
+    """
+    yahoo_symbol = "GC%3DF" if coin == "xau" else "SI%3DF"
+    coingecko_id = "pax-gold" if coin == "xau" else "tether-gold"
+
+    # ── Source 1: Yahoo Finance ───────────────────────
     try:
-        data = api_get(f"{METALS_BASE}/latest")
-        if not data or not isinstance(data, list):
-            return None
-        metals = {item["metal"]: item for item in data}
-        key    = "gold" if coin == "xau" else "silver"
-        if key not in metals:
-            return None
-        price = float(metals[key]["price"])
-        return {
-            "price":  price,
-            "high":   price * 1.005,
-            "low":    price * 0.995,
-            "change": 0.0,
-            "volume": 0,
-            "time":   datetime.now(timezone.utc).strftime("%H:%M UTC"),
-            "source": "Metals.live",
-        }
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={yahoo_symbol}"
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        result = data["quoteResponse"]["result"]
+        if result and len(result) > 0:
+            q      = result[0]
+            price  = float(q["regularMarketPrice"])
+            high   = float(q.get("regularMarketDayHigh", price * 1.005))
+            low    = float(q.get("regularMarketDayLow",  price * 0.995))
+            change = float(q.get("regularMarketChangePercent", 0.0))
+            volume = int(q.get("regularMarketVolume", 0))
+            logger.info(f"[{coin.upper()}] Yahoo Finance OK: ${price}")
+            return {
+                "price":  price,
+                "high":   high,
+                "low":    low,
+                "change": round(change, 2),
+                "volume": volume,
+                "time":   datetime.now(timezone.utc).strftime("%H:%M UTC"),
+                "source": "Yahoo Finance",
+            }
     except Exception as e:
-        logger.error(f"Metal ticker error: {e}")
-        return None
+        logger.warning(f"[{coin.upper()}] Yahoo Finance failed: {e}")
+
+    # ── Source 2: metals.live ─────────────────────────
+    try:
+        r    = requests.get(f"{METALS_BASE}/latest",
+                            headers={"accept": "application/json"}, timeout=10)
+        data = r.json()
+        if isinstance(data, list):
+            metals = {}
+            for item in data:
+                if isinstance(item, dict):
+                    if "metal" in item:
+                        metals[item["metal"]] = item.get("price", 0)
+                    else:
+                        metals.update(item)
+            key   = "gold" if coin == "xau" else "silver"
+            price = float(metals.get(key, 0))
+            if price > 0:
+                logger.info(f"[{coin.upper()}] Metals.live OK: ${price}")
+                return {
+                    "price":  price,
+                    "high":   price * 1.005,
+                    "low":    price * 0.995,
+                    "change": 0.0,
+                    "volume": 0,
+                    "time":   datetime.now(timezone.utc).strftime("%H:%M UTC"),
+                    "source": "Metals.live",
+                }
+    except Exception as e:
+        logger.warning(f"[{coin.upper()}] Metals.live failed: {e}")
+
+    # ── Source 3: CoinGecko PAXG/XAUT (approx) ───────
+    try:
+        data = api_get(
+            f"{COINGECKO_BASE}/coins/markets",
+            params={"vs_currency": "usd", "ids": coingecko_id},
+        )
+        if data and isinstance(data, list) and len(data) > 0:
+            d     = data[0]
+            price = float(d["current_price"])
+            logger.info(f"[{coin.upper()}] CoinGecko fallback OK: ${price}")
+            return {
+                "price":  price,
+                "high":   float(d.get("high_24h", price * 1.005)),
+                "low":    float(d.get("low_24h",  price * 0.995)),
+                "change": float(d.get("price_change_percentage_24h", 0.0)),
+                "volume": float(d.get("total_volume", 0)),
+                "time":   datetime.now(timezone.utc).strftime("%H:%M UTC"),
+                "source": f"CoinGecko (~{coin.upper()})",
+            }
+    except Exception as e:
+        logger.warning(f"[{coin.upper()}] CoinGecko fallback failed: {e}")
+
+    logger.error(f"[{coin.upper()}] ALL 3 sources failed!")
+    return None
 
 
 def get_klines(coin, interval, limit=100):
@@ -219,9 +343,9 @@ def calc_macd(candles):
             result.append(v * k + result[-1] * (1 - k))
         return result
 
-    ema12    = ema(closes, 12)
-    ema26    = ema(closes, 26)
-    macd_line  = [e12 - e26 for e12, e26 in zip(ema12, ema26)]
+    ema12       = ema(closes, 12)
+    ema26       = ema(closes, 26)
+    macd_line   = [e12 - e26 for e12, e26 in zip(ema12, ema26)]
     signal_line = ema(macd_line, 9)
     histogram   = macd_line[-1] - signal_line[-1]
     return round(macd_line[-1], 6), round(signal_line[-1], 6), round(histogram, 6)
@@ -321,6 +445,7 @@ def fmt(price):
 #                     KEYBOARDS
 # ════════════════════════════════════════════════════════
 def main_kb(coin):
+    alert = get_alert("_", coin)  # default check (no chat_id here — used in display only)
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📊 15m",   callback_data=f"tf_{coin}_15m"),
@@ -332,7 +457,28 @@ def main_kb(coin):
             InlineKeyboardButton("🔬 Analyse", callback_data=f"analyse_{coin}"),
         ],
         [
-            InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{coin}"),
+            InlineKeyboardButton("🎯 Set TP",  callback_data=f"settp_{coin}"),
+            InlineKeyboardButton("🔴 Set SL",  callback_data=f"setsl_{coin}"),
+        ],
+        [
+            InlineKeyboardButton("📋 My Alerts", callback_data=f"alerts_{coin}"),
+            InlineKeyboardButton("🔄 Refresh",   callback_data=f"refresh_{coin}"),
+        ],
+    ])
+
+
+def alert_kb(coin):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎯 Set TP",   callback_data=f"settp_{coin}"),
+            InlineKeyboardButton("🔴 Set SL",   callback_data=f"setsl_{coin}"),
+        ],
+        [
+            InlineKeyboardButton("❌ Clear TP", callback_data=f"cleartp_{coin}"),
+            InlineKeyboardButton("❌ Clear SL", callback_data=f"clearsl_{coin}"),
+        ],
+        [
+            InlineKeyboardButton("🔙 Back",     callback_data=f"price_{coin}"),
         ],
     ])
 
@@ -355,6 +501,26 @@ def build_dashboard(coin, d):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🕐 Updated: {d['time']}\n"
         f"🚀 {d['source']}"
+    )
+
+
+def build_alerts_msg(chat_id, coin):
+    a = get_alert(chat_id, coin)
+    e = EMOJI.get(coin, "💰")
+    tp_str = fmt(a["tp"]) if a["tp"] else "❌ Set nahi hai"
+    sl_str = fmt(a["sl"]) if a["sl"] else "❌ Set nahi hai"
+    d = get_ticker(coin)
+    price_str = fmt(d["price"]) if d else "N/A"
+    return (
+        f"{e} *{coin.upper()} — Aapke Alerts*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💵 Current Price: *{price_str}*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Take Profit: *{tp_str}*\n"
+        f"🔴 Stop Loss:   *{sl_str}*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ Bot har 10 sec mein check karta hai\n"
+        f"📲 Price hit hone par notification aayega!"
     )
 
 
@@ -392,7 +558,7 @@ def build_analyse(coin, candles):
     ps            = price_struct(candles)
     current       = candles[-1]["close"]
 
-    rsi_s = "🔴 Overbought" if rsi >= 70 else ("🟢 Oversold" if rsi <= 30 else "🟡 Neutral")
+    rsi_s  = "🔴 Overbought" if rsi >= 70 else ("🟢 Oversold" if rsi <= 30 else "🟡 Neutral")
     macd_s = ("📈 Bullish Crossover" if hist and hist > 0 else "📉 Bearish Crossover") if hist else "⚪ No Signal"
     sar_s  = "🟢 Buy (dots below)" if bull else "🔴 Sell (dots above)"
 
@@ -422,6 +588,73 @@ def build_analyse(coin, candles):
     )
 
 # ════════════════════════════════════════════════════════
+#              TP/SL BACKGROUND MONITOR JOB
+# ════════════════════════════════════════════════════════
+async def check_tp_sl_alerts(context: ContextTypes.DEFAULT_TYPE):
+    """Runs every 60 seconds — checks all active TP/SL alerts."""
+    if not alerts:
+        return
+
+    for chat_id, coins_data in list(alerts.items()):
+        for coin, alert_data in list(coins_data.items()):
+            tp = alert_data.get("tp")
+            sl = alert_data.get("sl")
+            if not tp and not sl:
+                continue
+
+            try:
+                ticker = get_ticker(coin)
+                if not ticker:
+                    continue
+                current_price = ticker["price"]
+                e = EMOJI.get(coin, "💰")
+
+                # ── TP HIT ──────────────────────────────
+                if tp and current_price >= tp:
+                    motivation = random.choice(TP_MOTIVATIONS)
+                    msg = (
+                        f"🎉🎉 *CONGRATULATIONS!* 🎉🎉\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"{e} *{coin.upper()} — TAKE PROFIT HIT!*\n\n"
+                        f"🎯 Aapka TP: *{fmt(tp)}*\n"
+                        f"💵 Current Price: *{fmt(current_price)}*\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"👏 Bahut khoob! Profit book ho gaya!\n\n"
+                        f"💬 _{motivation}_"
+                    )
+                    await context.bot.send_message(
+                        chat_id=int(chat_id),
+                        text=msg,
+                        parse_mode="Markdown",
+                    )
+                    clear_alert_tp(chat_id, coin)
+                    logger.info(f"TP hit for {coin} | chat_id={chat_id}")
+
+                # ── SL HIT ──────────────────────────────
+                elif sl and current_price <= sl:
+                    motivation = random.choice(SL_MOTIVATIONS)
+                    msg = (
+                        f"😢 *Stop Loss Hit Ho Gaya...*\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"{e} *{coin.upper()} — STOP LOSS TRIGGERED*\n\n"
+                        f"🔴 Aapka SL: *{fmt(sl)}*\n"
+                        f"💵 Current Price: *{fmt(current_price)}*\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🛡️ Capital protect ho gaya — sahi decision tha!\n\n"
+                        f"💬 _{motivation}_"
+                    )
+                    await context.bot.send_message(
+                        chat_id=int(chat_id),
+                        text=msg,
+                        parse_mode="Markdown",
+                    )
+                    clear_alert_sl(chat_id, coin)
+                    logger.info(f"SL hit for {coin} | chat_id={chat_id}")
+
+            except Exception as e:
+                logger.error(f"Alert check error [{coin}|{chat_id}]: {e}")
+
+# ════════════════════════════════════════════════════════
 #                    BOT HANDLERS
 # ════════════════════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -434,10 +667,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/pp doge` — Dogecoin\n"
         "`/pp xau`  — Gold 🥇\n"
         "`/pp xag`  — Silver 🥈\n\n"
+        "`/alerts`  — Apne saare active alerts dekho\n\n"
         "📊 *Features:*\n"
         "• Live Price\n"
         "• Support & Resistance (15m/1H/4H)\n"
         "• RSI, MACD, SAR Analysis\n"
+        "• 🎯 Take Profit Alert\n"
+        "• 🔴 Stop Loss Alert\n"
         "• Market Bias & Confidence\n\n"
         "⚡ *Powered by CoinGecko API*\n\n"
         "💪 *Happy Trading!*",
@@ -468,11 +704,47 @@ async def cmd_pp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q    = update.callback_query
-    await q.answer()
-    data = q.data
+async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all active alerts for this user."""
+    chat_id = str(update.effective_chat.id)
+    user_alerts = alerts.get(chat_id, {})
 
+    if not user_alerts or all(
+        not v.get("tp") and not v.get("sl") for v in user_alerts.values()
+    ):
+        await update.message.reply_text(
+            "📋 *Koi active alerts nahi hain!*\n\n"
+            "Kisi coin ke liye `/pp btc` type karo\n"
+            "aur phir 🎯 Set TP ya 🔴 Set SL button dabao.",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = ["📋 *Aapke Active Alerts:*\n━━━━━━━━━━━━━━━━━━"]
+    for coin, data in user_alerts.items():
+        tp = data.get("tp")
+        sl = data.get("sl")
+        if not tp and not sl:
+            continue
+        e = EMOJI.get(coin, "💰")
+        lines.append(f"\n{e} *{coin.upper()}*")
+        if tp:
+            lines.append(f"   🎯 TP: {fmt(tp)}")
+        if sl:
+            lines.append(f"   🔴 SL: {fmt(sl)}")
+    lines.append("\n━━━━━━━━━━━━━━━━━━")
+    lines.append("⚡ Har 10 sec mein check hota hai!")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q       = update.callback_query
+    await q.answer()
+    data    = q.data
+    chat_id = str(q.message.chat_id)
+
+    # ── Timeframe ─────────────────────────────────────
     if data.startswith("tf_"):
         parts    = data.split("_")
         coin, tf = parts[1], parts[2]
@@ -483,6 +755,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_kb(coin),
         )
 
+    # ── Price ─────────────────────────────────────────
     elif data.startswith("price_"):
         coin = data[6:]
         d    = get_ticker(coin)
@@ -495,6 +768,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_kb(coin),
         )
 
+    # ── Analyse ───────────────────────────────────────
     elif data.startswith("analyse_"):
         coin    = data[8:]
         candles = get_klines(coin, "1h", 100)
@@ -504,17 +778,143 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_kb(coin),
         )
 
+    # ── Refresh ───────────────────────────────────────
     elif data.startswith("refresh_"):
         coin = data[8:]
-        d    = get_ticker(coin)
+        await q.answer("⏳ Fetching fresh data...")
+        d = get_ticker(coin)
         if not d:
             await q.answer("❌ Data nahi mila!", show_alert=True)
             return
+        try:
+            await q.edit_message_text(
+                build_dashboard(coin, d),
+                parse_mode="Markdown",
+                reply_markup=main_kb(coin),
+            )
+        except Exception:
+            # If message content unchanged, just answer silently
+            await q.answer("✅ Already up to date!", show_alert=False)
+
+    # ── My Alerts ─────────────────────────────────────
+    elif data.startswith("alerts_"):
+        coin = data[7:]
         await q.edit_message_text(
-            build_dashboard(coin, d),
+            build_alerts_msg(chat_id, coin),
             parse_mode="Markdown",
-            reply_markup=main_kb(coin),
+            reply_markup=alert_kb(coin),
         )
+
+    # ── Set TP ────────────────────────────────────────
+    elif data.startswith("settp_"):
+        coin = data[6:]
+        d    = get_ticker(coin)
+        price_hint = f"\n💵 Current price: *{fmt(d['price'])}*" if d else ""
+        context.user_data["waiting_for"] = {"type": "tp", "coin": coin}
+        await q.edit_message_text(
+            f"🎯 *Take Profit Set Karo — {coin.upper()}*\n"
+            f"━━━━━━━━━━━━━━━━━━"
+            f"{price_hint}\n\n"
+            f"📝 Abhi apna TP price type karo:\n"
+            f"_(Sirf number likhna hai, jaise: `85000`)_\n\n"
+            f"❌ Cancel karne ke liye `/cancel` likhو",
+            parse_mode="Markdown",
+        )
+
+    # ── Set SL ────────────────────────────────────────
+    elif data.startswith("setsl_"):
+        coin = data[6:]
+        d    = get_ticker(coin)
+        price_hint = f"\n💵 Current price: *{fmt(d['price'])}*" if d else ""
+        context.user_data["waiting_for"] = {"type": "sl", "coin": coin}
+        await q.edit_message_text(
+            f"🔴 *Stop Loss Set Karo — {coin.upper()}*\n"
+            f"━━━━━━━━━━━━━━━━━━"
+            f"{price_hint}\n\n"
+            f"📝 Abhi apna SL price type karo:\n"
+            f"_(Sirf number likhna hai, jaise: `78000`)_\n\n"
+            f"❌ Cancel karne ke liye `/cancel` likho",
+            parse_mode="Markdown",
+        )
+
+    # ── Clear TP ──────────────────────────────────────
+    elif data.startswith("cleartp_"):
+        coin = data[8:]
+        clear_alert_tp(chat_id, coin)
+        await q.edit_message_text(
+            build_alerts_msg(chat_id, coin),
+            parse_mode="Markdown",
+            reply_markup=alert_kb(coin),
+        )
+        await q.answer("✅ TP clear kar diya!", show_alert=False)
+
+    # ── Clear SL ──────────────────────────────────────
+    elif data.startswith("clearsl_"):
+        coin = data[8:]
+        clear_alert_sl(chat_id, coin)
+        await q.edit_message_text(
+            build_alerts_msg(chat_id, coin),
+            parse_mode="Markdown",
+            reply_markup=alert_kb(coin),
+        )
+        await q.answer("✅ SL clear kar diya!", show_alert=False)
+
+
+async def handle_price_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles text input when user is setting TP or SL price."""
+    waiting = context.user_data.get("waiting_for")
+    if not waiting:
+        return  # Not waiting for input — ignore
+
+    text    = update.message.text.strip().replace(",", "")
+    chat_id = str(update.effective_chat.id)
+    coin    = waiting["coin"]
+    kind    = waiting["type"]  # "tp" or "sl"
+
+    try:
+        price = float(text)
+        if price <= 0:
+            raise ValueError("Price must be positive")
+    except ValueError:
+        await update.message.reply_text(
+            "❌ *Invalid price!*\nSirf number likhو jaise: `85000` ya `0.15`\n\nDobara try karo:",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Save alert
+    if kind == "tp":
+        set_alert(chat_id, coin, tp=price)
+        e = EMOJI.get(coin, "💰")
+        await update.message.reply_text(
+            f"✅ *Take Profit Set Ho Gaya!*\n\n"
+            f"{e} *{coin.upper()}*\n"
+            f"🎯 TP: *{fmt(price)}*\n\n"
+            f"⚡ Jaise hi price *{fmt(price)}* tak pahunche ga,\n"
+            f"aapko notification aayega! 🔔",
+            parse_mode="Markdown",
+        )
+    else:
+        set_alert(chat_id, coin, sl=price)
+        e = EMOJI.get(coin, "💰")
+        await update.message.reply_text(
+            f"✅ *Stop Loss Set Ho Gaya!*\n\n"
+            f"{e} *{coin.upper()}*\n"
+            f"🔴 SL: *{fmt(price)}*\n\n"
+            f"⚡ Jaise hi price *{fmt(price)}* tak gire ga,\n"
+            f"aapko notification aayega! 🔔",
+            parse_mode="Markdown",
+        )
+
+    context.user_data.pop("waiting_for", None)
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("waiting_for"):
+        context.user_data.pop("waiting_for", None)
+        await update.message.reply_text("❌ *Cancel kar diya!*", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("ℹ️ Kuch cancel karne ko nahi tha.", parse_mode="Markdown")
 
 # ════════════════════════════════════════════════════════
 #                        MAIN
@@ -524,11 +924,29 @@ def main():
     logger.info(f"Flask running on port {PORT}")
 
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("pp",    cmd_pp))
+
+    # Commands
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("pp",     cmd_pp))
+    app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+
+    # Button callbacks
     app.add_handler(CallbackQueryHandler(handle_button))
 
-    logger.info("✅ Crypto Analysis Bot chal raha hai!")
+    # Text input (for TP/SL price entry)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_price_input))
+
+    # ── Background job: Check TP/SL every 60 seconds ──
+    job_queue = app.job_queue
+    job_queue.run_repeating(
+        check_tp_sl_alerts,
+        interval=10,
+        first=5,
+        name="tp_sl_monitor",
+    )
+
+    logger.info("✅ Crypto Analysis Bot chal raha hai! (TP/SL monitoring active)")
     app.run_polling(drop_pending_updates=True)
 
 
