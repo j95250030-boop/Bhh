@@ -5,12 +5,15 @@ Features:
 - Live price with indicators (EMA, MACD, RSI, Bollinger, SAR)
 - Set TP (Take Profit) and SL (Stop Loss) for practice
 - Auto notification when TP/SL hit
-- Beautiful formatted messages with emojis
+- Whale Activity Detection
+- Market Depth Analysis
+- Beautiful formatted messages
 
 Setup:
 1. pip install python-telegram-bot requests
 2. Create bot via @BotFather and get token
-3. Replace BOT_TOKEN with your token
+3. Set environment variable: export BOT_TOKEN="your_token"
+   OR add BOT_TOKEN to GitHub Actions Secrets
 4. Run: python telegram_bot.py
 """
 
@@ -18,6 +21,7 @@ import asyncio
 import os
 import sys
 import requests
+import random
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -30,10 +34,12 @@ from telegram.ext import (
 )
 
 # ============== CONFIGURATION ==============
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Set this in GitHub Secrets / Environment Variables
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Set this in GitHub Secrets or .env
+
 if not BOT_TOKEN:
     print("❌ ERROR: BOT_TOKEN environment variable not set!")
-    print("   GitHub par jao: Settings → Secrets → New secret → BOT_TOKEN")
+    print("   GitHub Actions: Add it in Settings > Secrets > Actions")
+    print("   Local: export BOT_TOKEN='your_token_here'")
     sys.exit(1)
 API_URL = "https://v0-binance-futures-api-two.vercel.app/api/crypto"
 
@@ -43,23 +49,31 @@ SYMBOLS = ["BTC", "ETH", "DOGE", "LTC", "BNB", "SOL", "XRP", "AVAX"]
 # Store user alerts (In production, use database)
 user_alerts = {}  # {user_id: [{symbol, tp, sl, entry, type}]}
 
+# Store whale alert subscriptions
+whale_subscriptions = {}  # {user_id: [symbols]}
+
+# Last whale data cache (to detect new whale activity)
+last_whale_data = {}
+
 # Motivational quotes for SL hit
 MOTIVATIONAL_QUOTES = [
-    "Every loss is a lesson. Keep learning! 📚",
-    "Markets reward patience. Stay strong! 💪",
-    "Even the best traders have losses. You got this! 🌟",
-    "Failure is the mother of success. Keep going! 🚀",
-    "One loss doesn't define you. Tomorrow is a new day! 🌅",
-    "Risk management is key. You're learning! 📈",
-    "The market will always be there. Take a break if needed! ☕",
-    "Losses are tuition fees for trading education! 🎓",
+    "Every loss is a lesson. Keep learning!",
+    "Markets reward patience. Stay strong!",
+    "Even the best traders have losses. You got this!",
+    "Failure is the mother of success. Keep going!",
+    "One loss doesn't define you. Tomorrow is a new day!",
+    "Risk management is key. You're learning!",
+    "The market will always be there. Take a break if needed!",
+    "Losses are tuition fees for trading education!",
+    "Stay disciplined, the profits will come!",
+    "Every expert was once a beginner. Keep practicing!",
 ]
 
 # ============== API FUNCTIONS ==============
 def fetch_crypto_data(symbol: str, interval: str = "1h") -> dict:
     """Fetch crypto data from our API"""
     try:
-        response = requests.get(f"{API_URL}?symbol={symbol}&interval={interval}", timeout=15)
+        response = requests.get(f"{API_URL}?symbol={symbol}&interval={interval}&depth=50", timeout=15)
         return response.json()
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -72,6 +86,16 @@ def get_current_price(symbol: str) -> float:
     return 0
 
 # ============== MESSAGE FORMATTERS ==============
+def format_number(num: float) -> str:
+    """Format large numbers"""
+    if num >= 1_000_000_000:
+        return f"{num/1_000_000_000:.2f}B"
+    elif num >= 1_000_000:
+        return f"{num/1_000_000:.2f}M"
+    elif num >= 1_000:
+        return f"{num/1_000:.2f}K"
+    return f"{num:,.0f}"
+
 def format_price_message(data: dict, symbol: str) -> str:
     """Format price message like screenshot"""
     d = data["data"]
@@ -85,14 +109,6 @@ def format_price_message(data: dict, symbol: str) -> str:
     change_emoji = "🟢" if change >= 0 else "🔴"
     change_arrow = "▲" if change >= 0 else "▼"
     
-    # Format volume
-    if volume >= 1_000_000_000:
-        vol_str = f"{volume/1_000_000_000:.2f}B"
-    elif volume >= 1_000_000:
-        vol_str = f"{volume/1_000_000:.2f}M"
-    else:
-        vol_str = f"{volume:,.0f}"
-    
     timestamp = datetime.utcnow().strftime("%H:%M UTC")
     
     message = f"""
@@ -105,7 +121,7 @@ def format_price_message(data: dict, symbol: str) -> str:
 
 📈 High:   <code>${high:,.2f}</code>
 📉 Low:    <code>${low:,.2f}</code>
-📊 Volume: <code>{vol_str}</code>
+📊 Volume: <code>{format_number(volume)}</code>
 ━━━━━━━━━━━━━━━━━━━━
 
 🕐 Updated: {timestamp}
@@ -127,7 +143,7 @@ def format_analysis_message(data: dict, symbol: str, interval: str) -> str:
     
     # EMA Analysis
     ema = ind["ema"]
-    ema_emoji = "🟢" if ema["trend"] == "BULLISH" else "🔴" if ema["trend"] == "BEARISH" else "🟡"
+    ema_emoji = "🟢" if ema["trend"] == "BULLISH" else "🔴"
     
     # MACD Analysis  
     macd = ind["macd"]
@@ -158,7 +174,12 @@ def format_analysis_message(data: dict, symbol: str, interval: str) -> str:
     vol_emoji = "🟢" if vol["signal"] == "HIGH" else "🔴" if vol["signal"] == "LOW" else "🟡"
     
     # Market Depth
-    depth_emoji = "🟢" if depth["marketPressure"] == "BUYING" else "🔴" if depth["marketPressure"] == "SELLING" else "🟡"
+    if "BUY" in depth["marketPressure"]:
+        depth_emoji = "🟢"
+    elif "SELL" in depth["marketPressure"]:
+        depth_emoji = "🔴"
+    else:
+        depth_emoji = "🟡"
     
     # Overall Signal
     bullish_count = sum([
@@ -250,6 +271,186 @@ def format_analysis_message(data: dict, symbol: str, interval: str) -> str:
 """
     return message
 
+def format_market_depth_message(data: dict, symbol: str) -> str:
+    """Format market depth message"""
+    d = data["data"]
+    depth = d["marketDepth"]
+    price = d["price"]["current"]
+    
+    # Market pressure emoji
+    if "STRONG_BUY" in depth["marketPressure"]:
+        pressure_emoji = "🟢🟢"
+        pressure_text = "STRONG BUYING"
+    elif "BUY" in depth["marketPressure"]:
+        pressure_emoji = "🟢"
+        pressure_text = "BUYING"
+    elif "STRONG_SELL" in depth["marketPressure"]:
+        pressure_emoji = "🔴🔴"
+        pressure_text = "STRONG SELLING"
+    elif "SELL" in depth["marketPressure"]:
+        pressure_emoji = "🔴"
+        pressure_text = "SELLING"
+    else:
+        pressure_emoji = "🟡"
+        pressure_text = "NEUTRAL"
+    
+    bids = depth["bids"]
+    asks = depth["asks"]
+    
+    # Bid/Ask ratio bar
+    ratio = float(depth["bidAskRatio"])
+    if ratio > 1:
+        buy_pct = min(int((ratio / (ratio + 1)) * 10), 10)
+        sell_pct = 10 - buy_pct
+    else:
+        sell_pct = min(int((1 / (ratio + 1)) * 10), 10)
+        buy_pct = 10 - sell_pct
+    
+    ratio_bar = "🟢" * buy_pct + "🔴" * sell_pct
+    
+    message = f"""
+📊 <b>Market Depth - {symbol}/USDT</b>
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+💵 <b>Price: ${price:,.2f}</b>
+
+━━━ {pressure_emoji} MARKET PRESSURE ━━━
+
+<b>Overall:</b> {pressure_text}
+<b>Bid/Ask Ratio:</b> {depth['bidAskRatio']}
+<b>Imbalance:</b> {depth['imbalance']}
+
+{ratio_bar}
+<code>Buyers        Sellers</code>
+
+━━━ 🟢 BUY SIDE (BIDS) ━━━
+
+💰 Total Volume: <code>{format_number(bids['totalVolume'])}</code>
+💵 Total Value: <code>${format_number(bids['totalValue'])}</code>
+
+🧱 <b>Largest Buy Wall:</b>
+   └ ${bids['largestWall']['price']:,.2f} ({format_number(bids['largestWall']['quantity'])} contracts)
+   └ Value: <code>${format_number(bids['largestWall']['total'])}</code>
+
+━━━ 🔴 SELL SIDE (ASKS) ━━━
+
+💰 Total Volume: <code>{format_number(asks['totalVolume'])}</code>
+💵 Total Value: <code>${format_number(asks['totalValue'])}</code>
+
+🧱 <b>Largest Sell Wall:</b>
+   └ ${asks['largestWall']['price']:,.2f} ({format_number(asks['largestWall']['quantity'])} contracts)
+   └ Value: <code>${format_number(asks['largestWall']['total'])}</code>
+
+━━━ 📈 SPREAD ━━━
+
+📏 Spread: <code>${depth['spread']['price']:.2f}</code>
+📊 Spread %: <code>{depth['spread']['percentage']}</code>
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🕐 {datetime.utcnow().strftime("%H:%M:%S UTC")}
+"""
+    return message
+
+def format_whale_activity_message(data: dict, symbol: str) -> str:
+    """Format whale activity message"""
+    d = data["data"]
+    whale = d.get("whaleActivity", {})
+    price = d["price"]["current"]
+    
+    if not whale.get("detected", False):
+        return f"""
+🐋 <b>Whale Activity - {symbol}/USDT</b>
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+💵 <b>Price: ${price:,.2f}</b>
+🎯 Threshold: ${format_number(whale.get('threshold', 0))}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+❌ <b>No whale activity detected</b>
+
+No orders above ${format_number(whale.get('threshold', 0))} found in the order book.
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🕐 {datetime.utcnow().strftime("%H:%M:%S UTC")}
+"""
+    
+    summary = whale["summary"]
+    walls = whale["walls"]
+    
+    # Sentiment emoji
+    if whale["sentiment"] == "BULLISH":
+        sentiment_emoji = "🟢🐋"
+        sentiment_text = "BULLISH (Whales Buying)"
+    elif whale["sentiment"] == "BEARISH":
+        sentiment_emoji = "🔴🐋"
+        sentiment_text = "BEARISH (Whales Selling)"
+    else:
+        sentiment_emoji = "🟡🐋"
+        sentiment_text = "NEUTRAL"
+    
+    # Alert if any
+    alert_text = f"\n⚠️ <b>{whale['alert']}</b>\n" if whale.get("alert") else ""
+    
+    # Top whale orders
+    top_orders_text = ""
+    for i, order in enumerate(whale.get("topOrders", [])[:5], 1):
+        side_emoji = "🟢 BUY" if order["side"] == "BUY" else "🔴 SELL"
+        top_orders_text += f"""
+   {i}. {side_emoji}
+      └ Price: ${order['price']:,.2f}
+      └ Value: <code>${format_number(order['valueUSD'])}</code>
+      └ Distance: {order['distanceFromPrice']}
+"""
+    
+    message = f"""
+🐋 <b>Whale Activity - {symbol}/USDT</b>
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+💵 <b>Price: ${price:,.2f}</b>
+🎯 Threshold: ${format_number(whale['threshold'])}
+{alert_text}
+━━━ {sentiment_emoji} WHALE SENTIMENT ━━━
+
+<b>Sentiment:</b> {sentiment_text}
+<b>Pressure:</b> {whale['pressure']}
+
+━━━ 📊 WHALE SUMMARY ━━━
+
+🟢 <b>Buy Orders:</b> {summary['buyOrders']}
+   └ Volume: <code>${format_number(summary['totalBuyVolume'])}</code>
+
+🔴 <b>Sell Orders:</b> {summary['sellOrders']}
+   └ Volume: <code>${format_number(summary['totalSellVolume'])}</code>
+
+💰 <b>Net Volume:</b> <code>${format_number(abs(summary['netVolume']))}</code>
+   └ {'🟢 Buyers dominating' if summary['netVolume'] > 0 else '🔴 Sellers dominating'}
+
+━━━ 🧱 WHALE WALLS ━━━
+"""
+
+    if walls.get("buyWall"):
+        message += f"""
+🟢 <b>Largest Buy Wall:</b>
+   └ Price: ${walls['buyWall']['price']:,.2f}
+   └ Value: <code>${format_number(walls['buyWall']['valueUSD'])}</code>
+"""
+    
+    if walls.get("sellWall"):
+        message += f"""
+🔴 <b>Largest Sell Wall:</b>
+   └ Price: ${walls['sellWall']['price']:,.2f}
+   └ Value: <code>${format_number(walls['sellWall']['valueUSD'])}</code>
+"""
+
+    message += f"""
+━━━ 🔝 TOP WHALE ORDERS ━━━
+{top_orders_text}
+━━━━━━━━━━━━━━━━━━━━━━━━
+🕐 {datetime.utcnow().strftime("%H:%M:%S UTC")}
+"""
+    return message
+
 def format_alerts_message(alerts: list) -> str:
     """Format user's active alerts"""
     if not alerts:
@@ -297,8 +498,16 @@ def get_main_keyboard(symbol: str = "BTC") -> InlineKeyboardMarkup:
             InlineKeyboardButton("🛑 Set SL", callback_data=f"setsl_{symbol}"),
         ],
         [
+            InlineKeyboardButton("🐋 Whales", callback_data=f"whales_{symbol}"),
+            InlineKeyboardButton("📊 Depth", callback_data=f"depth_{symbol}"),
+        ],
+        [
             InlineKeyboardButton("📋 My Alerts", callback_data="myalerts"),
             InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{symbol}"),
+        ],
+        [
+            InlineKeyboardButton("🔔 Whale Alerts", callback_data=f"whale_alert_{symbol}"),
+            InlineKeyboardButton("⬇️", callback_data="collapse"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -323,6 +532,13 @@ def get_cancel_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("❌ Cancel", callback_data="cancel")
     ]])
 
+def get_back_keyboard(symbol: str) -> InlineKeyboardMarkup:
+    """Back button keyboard"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"price_{symbol}")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data=f"whales_{symbol}")]
+    ])
+
 # ============== HANDLERS ==============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
@@ -335,14 +551,19 @@ Welcome! I provide real-time crypto futures data with technical analysis.
 <b>Commands:</b>
 /p [symbol] - Get price (e.g., /p btc)
 /a [symbol] - Full analysis
+/w [symbol] - Whale activity
+/d [symbol] - Market depth
 /alerts - View your alerts
 
 <b>Features:</b>
 • Live futures prices
 • Technical indicators (EMA, MACD, RSI, SAR, Bollinger)
 • Support/Resistance levels
+• 🐋 Whale Activity Detection
+• 📊 Market Depth Analysis
 • Set TP/SL for practice trading
 • Auto notifications when TP/SL hit
+• Auto whale activity alerts
 
 ━━━━━━━━━━━━━━━━━━━━
 
@@ -398,6 +619,50 @@ async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await msg.edit_text(f"❌ Error: {data.get('error', 'Unknown error')}")
 
+async def whale_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /w command for whale activity"""
+    if context.args:
+        symbol = context.args[0].upper()
+        if symbol not in SYMBOLS:
+            await update.message.reply_text(f"❌ Symbol not supported. Use: {', '.join(SYMBOLS)}")
+            return
+    else:
+        symbol = "BTC"
+    
+    msg = await update.message.reply_text("🐋 Detecting whale activity...")
+    
+    data = fetch_crypto_data(symbol)
+    if data.get("success"):
+        await msg.edit_text(
+            format_whale_activity_message(data, symbol),
+            parse_mode="HTML",
+            reply_markup=get_back_keyboard(symbol)
+        )
+    else:
+        await msg.edit_text(f"❌ Error: {data.get('error', 'Unknown error')}")
+
+async def depth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /d command for market depth"""
+    if context.args:
+        symbol = context.args[0].upper()
+        if symbol not in SYMBOLS:
+            await update.message.reply_text(f"❌ Symbol not supported. Use: {', '.join(SYMBOLS)}")
+            return
+    else:
+        symbol = "BTC"
+    
+    msg = await update.message.reply_text("📊 Fetching market depth...")
+    
+    data = fetch_crypto_data(symbol)
+    if data.get("success"):
+        await msg.edit_text(
+            format_market_depth_message(data, symbol),
+            parse_mode="HTML",
+            reply_markup=get_back_keyboard(symbol)
+        )
+    else:
+        await msg.edit_text(f"❌ Error: {data.get('error', 'Unknown error')}")
+
 async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /alerts command"""
     user_id = update.effective_user.id
@@ -418,7 +683,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Symbol selection
     if data.startswith("symbol_"):
         symbol = data.split("_")[1]
-        msg = await query.edit_message_text("⏳ Fetching data...")
         api_data = fetch_crypto_data(symbol)
         if api_data.get("success"):
             await query.edit_message_text(
@@ -467,6 +731,41 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
                 reply_markup=get_main_keyboard(symbol)
             )
+    
+    # Whale activity
+    elif data.startswith("whales_"):
+        symbol = data.split("_")[1]
+        api_data = fetch_crypto_data(symbol)
+        if api_data.get("success"):
+            await query.edit_message_text(
+                format_whale_activity_message(api_data, symbol),
+                parse_mode="HTML",
+                reply_markup=get_back_keyboard(symbol)
+            )
+    
+    # Market depth
+    elif data.startswith("depth_"):
+        symbol = data.split("_")[1]
+        api_data = fetch_crypto_data(symbol)
+        if api_data.get("success"):
+            await query.edit_message_text(
+                format_market_depth_message(api_data, symbol),
+                parse_mode="HTML",
+                reply_markup=get_back_keyboard(symbol)
+            )
+    
+    # Whale alert subscription
+    elif data.startswith("whale_alert_"):
+        symbol = data.split("_")[2]
+        if user_id not in whale_subscriptions:
+            whale_subscriptions[user_id] = []
+        
+        if symbol in whale_subscriptions[user_id]:
+            whale_subscriptions[user_id].remove(symbol)
+            await query.answer(f"🔕 Whale alerts disabled for {symbol}")
+        else:
+            whale_subscriptions[user_id].append(symbol)
+            await query.answer(f"🔔 Whale alerts enabled for {symbol}")
     
     # Set TP
     elif data.startswith("settp_"):
@@ -528,6 +827,13 @@ Current Price: <code>${current_price:,.2f}</code>
         context.user_data.pop("pending_alert", None)
         await query.edit_message_text(
             "❌ Cancelled. Select a coin:",
+            reply_markup=get_symbol_keyboard()
+        )
+    
+    # Collapse
+    elif data == "collapse":
+        await query.edit_message_text(
+            "Select a coin:",
             reply_markup=get_symbol_keyboard()
         )
 
@@ -596,7 +902,6 @@ Good luck! 🍀
 # ============== PRICE MONITOR ==============
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
     """Background task to check TP/SL alerts"""
-    import random
     
     for user_id, alerts in list(user_alerts.items()):
         alerts_to_remove = []
@@ -676,6 +981,81 @@ and come back stronger! 📈
         for i in sorted(alerts_to_remove, reverse=True):
             user_alerts[user_id].pop(i)
 
+# ============== WHALE MONITOR ==============
+async def check_whale_activity(context: ContextTypes.DEFAULT_TYPE):
+    """Background task to check whale activity and send alerts"""
+    global last_whale_data
+    
+    for user_id, symbols in list(whale_subscriptions.items()):
+        for symbol in symbols:
+            try:
+                data = fetch_crypto_data(symbol)
+                if not data.get("success"):
+                    continue
+                
+                whale = data["data"].get("whaleActivity", {})
+                if not whale.get("detected"):
+                    continue
+                
+                # Check if this is new whale activity
+                last_key = f"{user_id}_{symbol}"
+                last_summary = last_whale_data.get(last_key, {})
+                current_summary = whale.get("summary", {})
+                
+                # Compare whale counts
+                last_buy_orders = last_summary.get("buyOrders", 0)
+                last_sell_orders = last_summary.get("sellOrders", 0)
+                current_buy_orders = current_summary.get("buyOrders", 0)
+                current_sell_orders = current_summary.get("sellOrders", 0)
+                
+                # Only alert if significant change in whale orders
+                buy_change = current_buy_orders - last_buy_orders
+                sell_change = current_sell_orders - last_sell_orders
+                
+                if abs(buy_change) >= 2 or abs(sell_change) >= 2:
+                    price = data["data"]["price"]["current"]
+                    
+                    if buy_change > sell_change:
+                        direction = "🟢 BUYING"
+                        emoji = "🐋📈"
+                    else:
+                        direction = "🔴 SELLING"
+                        emoji = "🐋📉"
+                    
+                    message = f"""
+{emoji} <b>WHALE ALERT - {symbol}/USDT</b>
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+💵 Price: <code>${price:,.2f}</code>
+
+🐋 <b>Whales are {direction}!</b>
+
+📊 Buy Orders: {current_buy_orders} ({'+' if buy_change >= 0 else ''}{buy_change})
+📊 Sell Orders: {current_sell_orders} ({'+' if sell_change >= 0 else ''}{sell_change})
+
+💰 Buy Volume: ${format_number(current_summary.get('totalBuyVolume', 0))}
+💰 Sell Volume: ${format_number(current_summary.get('totalSellVolume', 0))}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🕐 {datetime.utcnow().strftime("%H:%M:%S UTC")}
+
+Use /w {symbol.lower()} for detailed whale info
+"""
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text=message,
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        print(f"Error sending whale alert to {user_id}: {e}")
+                
+                # Update last whale data
+                last_whale_data[last_key] = current_summary
+                
+            except Exception as e:
+                print(f"Error checking whale activity for {symbol}: {e}")
+
 # ============== MAIN ==============
 def main():
     """Start the bot"""
@@ -690,6 +1070,10 @@ def main():
     app.add_handler(CommandHandler("pp", price_command))  # Alias
     app.add_handler(CommandHandler("a", analyse_command))
     app.add_handler(CommandHandler("analyse", analyse_command))
+    app.add_handler(CommandHandler("w", whale_command))
+    app.add_handler(CommandHandler("whale", whale_command))
+    app.add_handler(CommandHandler("d", depth_command))
+    app.add_handler(CommandHandler("depth", depth_command))
     app.add_handler(CommandHandler("alerts", alerts_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -697,8 +1081,19 @@ def main():
     # Add job to check alerts every 30 seconds
     app.job_queue.run_repeating(check_alerts, interval=30, first=10)
     
+    # Add job to check whale activity every 60 seconds
+    app.job_queue.run_repeating(check_whale_activity, interval=60, first=30)
+    
     print("✅ Bot is running!")
     print("📱 Open Telegram and message your bot")
+    print("")
+    print("Features:")
+    print("  • /p [symbol] - Price")
+    print("  • /a [symbol] - Analysis")
+    print("  • /w [symbol] - Whale Activity")
+    print("  • /d [symbol] - Market Depth")
+    print("  • TP/SL Alerts")
+    print("  • Auto Whale Alerts")
     
     # Start polling
     app.run_polling(allowed_updates=Update.ALL_TYPES)
