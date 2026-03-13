@@ -15,6 +15,8 @@ Setup:
 """
 
 import asyncio
+import os
+import sys
 import requests
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,7 +30,11 @@ from telegram.ext import (
 )
 
 # ============== CONFIGURATION ==============
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Get from @BotFather
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Set this in GitHub Secrets / Environment Variables
+if not BOT_TOKEN:
+    print("❌ ERROR: BOT_TOKEN environment variable not set!")
+    print("   GitHub par jao: Settings → Secrets → New secret → BOT_TOKEN")
+    sys.exit(1)
 API_URL = "https://v0-binance-futures-api-two.vercel.app/api/crypto"
 
 # Supported symbols
