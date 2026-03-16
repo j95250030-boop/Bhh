@@ -199,7 +199,7 @@ def _support_resistance(candles):
 
 # ── Main fetcher ─────────────────────────────────────────────
 
-def fetch_from_binance_direct(symbol: str, interval: str = "1h") -> dict:
+def fetch_from_binance_direct(symbol: str, interval: str = "1h", proxies: dict = None) -> dict:
     """
     Fetch from Binance Futures directly and return data
     in the same format as the Vercel proxy response.
@@ -210,7 +210,7 @@ def fetch_from_binance_direct(symbol: str, interval: str = "1h") -> dict:
         # 1. Ticker
         t = requests.get(
             f"{BINANCE_DIRECT_BASE}/fapi/v1/ticker/24hr",
-            params={"symbol": sym}, timeout=8
+            params={"symbol": sym}, proxies=proxies, timeout=8
         ).json()
         if "lastPrice" not in t:
             return {"success": False, "error": "Binance blocked or invalid"}
@@ -224,14 +224,14 @@ def fetch_from_binance_direct(symbol: str, interval: str = "1h") -> dict:
         # 2. Funding rate
         fr_data = requests.get(
             f"{BINANCE_DIRECT_BASE}/fapi/v1/fundingRate",
-            params={"symbol": sym, "limit": 1}, timeout=8
+            params={"symbol": sym, "limit": 1}, proxies=proxies, timeout=8
         ).json()
         funding = float(fr_data[0]["fundingRate"]) if isinstance(fr_data, list) and fr_data else 0.0
 
         # 3. Klines
         klines = requests.get(
             f"{BINANCE_DIRECT_BASE}/fapi/v1/klines",
-            params={"symbol": sym, "interval": interval, "limit": 100}, timeout=8
+            params={"symbol": sym, "interval": interval, "limit": 100}, proxies=proxies, timeout=8
         ).json()
         if not isinstance(klines, list) or len(klines) < 10:
             return {"success": False, "error": "Klines fetch failed"}
@@ -245,7 +245,7 @@ def fetch_from_binance_direct(symbol: str, interval: str = "1h") -> dict:
         # 4. Depth
         depth_raw = requests.get(
             f"{BINANCE_DIRECT_BASE}/fapi/v1/depth",
-            params={"symbol": sym, "limit": 50}, timeout=8
+            params={"symbol": sym, "limit": 50}, proxies=proxies, timeout=8
         ).json()
         bids = [[float(b[0]), float(b[1])] for b in depth_raw.get("bids", [])]
         asks = [[float(a[0]), float(a[1])] for a in depth_raw.get("asks", [])]
@@ -429,17 +429,76 @@ def fetch_from_binance_direct(symbol: str, interval: str = "1h") -> dict:
         return {"success": False, "error": str(e)}
 
 
+# ── Indian Proxy List ────────────────────────────────────────
+INDIAN_PROXIES = [
+    "103.93.193.141:58080",
+    "217.217.249.160:8080",
+    "203.192.217.6:8080",
+    "160.19.41.61:80",
+    "202.43.122.156:1111",
+    "103.179.46.49:6789",
+    "203.110.240.156:80",
+    "103.199.215.43:6262",
+    "103.80.224.33:83",
+    "103.170.46.245:8080",
+    "117.247.233.50:8080",
+    "45.250.215.8:8080",
+    "103.205.64.153:80",
+    "103.147.98.122:8080",
+    "45.248.27.145:8080",
+    "103.136.82.252:83",
+    "14.99.215.106:1111",
+    "103.148.39.38:83",
+]
+
+
+def fetch_from_binance_proxy(symbol: str, interval: str = "1h") -> dict:
+    """Try Binance Futures via Indian proxies."""
+    import random
+    proxies_to_try = random.sample(INDIAN_PROXIES, min(3, len(INDIAN_PROXIES)))
+    for proxy in proxies_to_try:
+        try:
+            proxies = {
+                "http":  f"http://{proxy}",
+                "https": f"http://{proxy}",
+            }
+            # Quick test with ticker first
+            sym = f"{symbol}USDT"
+            test = requests.get(
+                f"{BINANCE_DIRECT_BASE}/fapi/v1/ticker/24hr",
+                params={"symbol": sym},
+                proxies=proxies,
+                timeout=6,
+            ).json()
+            if "lastPrice" not in test:
+                continue
+            # Proxy works — do full fetch
+            result = fetch_from_binance_direct(symbol, interval, proxies=proxies)
+            if result.get("success"):
+                result["source"] = f"Binance Futures (Proxy)"
+                return result
+        except Exception:
+            continue
+    return {"success": False, "error": "All proxies failed"}
+
+
 def fetch_crypto_data(symbol: str, interval: str = "1h") -> dict:
     """
-    Try Binance Futures direct first.
-    If blocked or failed → fallback to Vercel proxy.
+    Step 1: Binance Futures direct (no proxy)
+    Step 2: Binance Futures via Indian proxy
+    Step 3: Vercel proxy fallback
     """
-    # Step 1: Try Binance direct
+    # Step 1: Binance direct
     result = fetch_from_binance_direct(symbol, interval)
     if result.get("success"):
         return result
 
-    # Step 2: Fallback to Vercel proxy
+    # Step 2: Indian proxy
+    result = fetch_from_binance_proxy(symbol, interval)
+    if result.get("success"):
+        return result
+
+    # Step 3: Vercel fallback
     try:
         r = requests.get(
             f"{BINANCE_API_URL}?symbol={symbol}&interval={interval}&depth=50",
