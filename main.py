@@ -42,8 +42,9 @@ if not BOT_TOKEN:
     print("   export BOT_TOKEN='your_token_here'")
     sys.exit(1)
 
-BINANCE_API_URL = "https://v0-binance-futures-api-two.vercel.app/api/crypto"
-BYBIT_API_URL   = "https://api.bybit.com/v5"
+BINANCE_DIRECT_BASE = "https://fapi.binance.com"
+BINANCE_API_URL     = "https://v0-binance-futures-api-two.vercel.app/api/crypto"
+BYBIT_API_URL       = "https://api.bybit.com/v5"
 
 # Crypto — via Binance Futures proxy
 SYMBOLS = ["BTC", "ETH", "DOGE", "LTC", "BNB", "SOL", "XRP", "AVAX"]
@@ -110,9 +111,335 @@ def format_number(num: float) -> str:
 
 
 # ============================================================
-# BINANCE API  (crypto)
+# BINANCE API  (crypto) — Direct + Vercel Fallback
 # ============================================================
+# ============================================================
+# BINANCE DIRECT + VERCEL FALLBACK (replacement section)
+# ============================================================
+
+# ── Indicator helpers ────────────────────────────────────────
+
+def _ema(closes, period):
+    k = 2 / (period + 1)
+    result = [closes[0]]
+    for v in closes[1:]:
+        result.append(v * k + result[-1] * (1 - k))
+    return result
+
+def _rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0)); losses.append(max(-d, 0))
+    ag = sum(gains[-period:]) / period
+    al = sum(losses[-period:]) / period
+    if al == 0: return 100.0
+    return round(100 - (100 / (1 + ag/al)), 2)
+
+def _macd(closes):
+    if len(closes) < 26: return 0, 0, 0
+    e12 = _ema(closes, 12); e26 = _ema(closes, 26)
+    ml  = [a - b for a, b in zip(e12, e26)]
+    sig = _ema(ml, 9)
+    return round(ml[-1], 6), round(sig[-1], 6), round(ml[-1] - sig[-1], 6)
+
+def _bollinger(closes, period=20, std_dev=2):
+    if len(closes) < period: return closes[-1], closes[-1], closes[-1]
+    window = closes[-period:]
+    mid    = sum(window) / period
+    var    = sum((x - mid) ** 2 for x in window) / period
+    std    = var ** 0.5
+    return round(mid + std_dev * std, 6), round(mid, 6), round(mid - std_dev * std, 6)
+
+def _sar(candles):
+    if len(candles) < 5: return candles[-1]["close"], True
+    highs  = [c["high"]  for c in candles]
+    lows   = [c["low"]   for c in candles]
+    closes = [c["close"] for c in candles]
+    af, max_af = 0.02, 0.2
+    bull   = closes[1] > closes[0]
+    ep     = highs[0] if bull else lows[0]
+    sar    = lows[0]  if bull else highs[0]
+    for i in range(2, len(candles)):
+        ps = sar
+        if bull:
+            sar = ps + af * (ep - ps); sar = min(sar, lows[i-1], lows[i-2])
+            if closes[i] > ep: ep = closes[i]; af = min(af + 0.02, max_af)
+            if closes[i] < sar: bull = False; sar = ep; ep = closes[i]; af = 0.02
+        else:
+            sar = ps + af * (ep - sar); sar = max(sar, highs[i-1], highs[i-2])
+            if closes[i] < ep: ep = closes[i]; af = min(af + 0.02, max_af)
+            if closes[i] > sar: bull = True; sar = ep; ep = closes[i]; af = 0.02
+    return round(sar, 8), bull
+
+def _support_resistance(candles):
+    if len(candles) < 10: return [], []
+    highs   = [c["high"]  for c in candles]
+    lows    = [c["low"]   for c in candles]
+    current = candles[-1]["close"]
+    sh, sl  = [], []
+    for i in range(2, len(candles) - 2):
+        if highs[i] == max(highs[i-2:i+3]): sh.append(highs[i])
+        if lows[i]  == min(lows[i-2:i+3]):  sl.append(lows[i])
+    def cluster(lvls, tol=0.005):
+        lvls = sorted(set(round(l, 8) for l in lvls))
+        if not lvls: return []
+        groups = []; grp = [lvls[0]]
+        for l in lvls[1:]:
+            if abs(l - grp[-1]) / grp[-1] < tol: grp.append(l)
+            else: groups.append(grp); grp = [l]
+        if grp: groups.append(grp)
+        return [round(sum(g)/len(g), 8) for g in groups]
+    res = sorted([l for l in cluster(sh) if l > current])[-3:]
+    sup = sorted([l for l in cluster(sl)  if l < current], reverse=True)[:3]
+    return res, sup
+
+
+# ── Main fetcher ─────────────────────────────────────────────
+
+def fetch_from_binance_direct(symbol: str, interval: str = "1h") -> dict:
+    """
+    Fetch from Binance Futures directly and return data
+    in the same format as the Vercel proxy response.
+    """
+    try:
+        sym = f"{symbol}USDT"
+
+        # 1. Ticker
+        t = requests.get(
+            f"{BINANCE_DIRECT_BASE}/fapi/v1/ticker/24hr",
+            params={"symbol": sym}, timeout=8
+        ).json()
+        if "lastPrice" not in t:
+            return {"success": False, "error": "Binance blocked or invalid"}
+
+        price  = float(t["lastPrice"])
+        high   = float(t["highPrice"])
+        low    = float(t["lowPrice"])
+        change = float(t["priceChangePercent"])
+        volume = float(t["volume"])
+
+        # 2. Funding rate
+        fr_data = requests.get(
+            f"{BINANCE_DIRECT_BASE}/fapi/v1/fundingRate",
+            params={"symbol": sym, "limit": 1}, timeout=8
+        ).json()
+        funding = float(fr_data[0]["fundingRate"]) if isinstance(fr_data, list) and fr_data else 0.0
+
+        # 3. Klines
+        klines = requests.get(
+            f"{BINANCE_DIRECT_BASE}/fapi/v1/klines",
+            params={"symbol": sym, "interval": interval, "limit": 100}, timeout=8
+        ).json()
+        if not isinstance(klines, list) or len(klines) < 10:
+            return {"success": False, "error": "Klines fetch failed"}
+
+        candles = [{"open": float(k[1]), "high": float(k[2]),
+                    "low": float(k[3]),  "close": float(k[4]),
+                    "vol": float(k[5])}  for k in klines]
+        closes  = [c["close"] for c in candles]
+        vols    = [c["vol"]   for c in candles]
+
+        # 4. Depth
+        depth_raw = requests.get(
+            f"{BINANCE_DIRECT_BASE}/fapi/v1/depth",
+            params={"symbol": sym, "limit": 50}, timeout=8
+        ).json()
+        bids = [[float(b[0]), float(b[1])] for b in depth_raw.get("bids", [])]
+        asks = [[float(a[0]), float(a[1])] for a in depth_raw.get("asks", [])]
+
+        # ── Compute indicators ──
+        e9  = _ema(closes, 9);  e21 = _ema(closes, 21); e50 = _ema(closes, 50)
+        ema_trend = "BULLISH" if e9[-1] > e21[-1] > e50[-1] else "BEARISH"
+
+        ml, sig, hist = _macd(closes)
+        macd_trend    = "BULLISH" if hist > 0 else "BEARISH"
+
+        rsi_val = _rsi(closes)
+        if rsi_val > 70:   rsi_sig = "OVERBOUGHT"
+        elif rsi_val < 30: rsi_sig = "OVERSOLD"
+        else:              rsi_sig = "NEUTRAL"
+
+        bb_up, bb_mid, bb_lo = _bollinger(closes)
+        if   price > bb_up: bb_pos = "OVERBOUGHT"
+        elif price < bb_lo: bb_pos = "OVERSOLD"
+        else:               bb_pos = "NEUTRAL"
+
+        sar_val, sar_bull = _sar(candles)
+        sar_trend = "BULLISH" if sar_bull else "BEARISH"
+
+        # ── Support / Resistance ──
+        res, sup = _support_resistance(candles)
+
+        # ── Volume ──
+        avg_vol   = sum(vols[-20:]) / 20 if len(vols) >= 20 else 1
+        vol_ratio = round(vols[-1] / avg_vol, 2) if avg_vol else 1
+        if vol_ratio > 1.5:   vol_sig = "HIGH"
+        elif vol_ratio < 0.5: vol_sig = "LOW"
+        else:                 vol_sig = "NORMAL"
+
+        # ── Depth analysis ──
+        bid_vol = sum(q for _, q in bids)
+        ask_vol = sum(q for _, q in asks)
+        bid_val = sum(p * q for p, q in bids)
+        ask_val = sum(p * q for p, q in asks)
+        ratio   = round(bid_vol / ask_vol, 2) if ask_vol else 1
+        imb     = round((bid_val - ask_val) / (bid_val + ask_val) * 100, 2) if (bid_val + ask_val) else 0
+        if   imb >  20: pressure = "STRONG_BUY"
+        elif imb >   5: pressure = "BUY"
+        elif imb < -20: pressure = "STRONG_SELL"
+        elif imb <  -5: pressure = "SELL"
+        else:           pressure = "NEUTRAL"
+
+        lbid = max(bids, key=lambda x: x[0]*x[1], default=[price, 0])
+        lask = max(asks, key=lambda x: x[0]*x[1], default=[price, 0])
+        spread_p = asks[0][0] - bids[0][0] if bids and asks else 0
+
+        # ── Whale detection (depth-based) ──
+        whale_thresh = 500_000
+        w_bids = [{"price":p,"qty":q,"value":p*q,"dist_pct":round(abs(price-p)/price*100,2)}
+                  for p,q in bids if p*q >= whale_thresh]
+        w_asks = [{"price":p,"qty":q,"value":p*q,"dist_pct":round(abs(p-price)/price*100,2)}
+                  for p,q in asks if p*q >= whale_thresh]
+        w_bids.sort(key=lambda x: x["value"], reverse=True)
+        w_asks.sort(key=lambda x: x["value"], reverse=True)
+        wb_vol = sum(x["value"] for x in w_bids)
+        wa_vol = sum(x["value"] for x in w_asks)
+        if wb_vol > wa_vol * 1.3:   w_sent = "BULLISH"
+        elif wa_vol > wb_vol * 1.3: w_sent = "BEARISH"
+        else:                       w_sent = "NEUTRAL"
+
+        # ── Price action ──
+        h6 = [c["high"]  for c in candles[-6:]]
+        l6 = [c["low"]   for c in candles[-6:]]
+        if h6[-1]>h6[-3]>h6[-5] and l6[-1]>l6[-3]>l6[-5]:
+            pa_trend, pa_pattern = "UPTREND",   "HIGHER_HIGHS"
+        elif h6[-1]<h6[-3]<h6[-5] and l6[-1]<l6[-3]<l6[-5]:
+            pa_trend, pa_pattern = "DOWNTREND", "LOWER_LOWS"
+        else:
+            pa_trend, pa_pattern = "SIDEWAYS",  "NEUTRAL"
+
+        bull_score = sum([ema_trend=="BULLISH", macd_trend=="BULLISH",
+                         rsi_val<50, sar_bull, bb_pos=="OVERSOLD"])
+        strength   = round(bull_score / 5 * 100)
+
+        # ── Assemble Vercel-compatible response ──
+        return {
+            "success": True,
+            "source":  "Binance Futures Direct",
+            "data": {
+                "price": {
+                    "current":         price,
+                    "lastFundingRate": funding,
+                },
+                "stats24h": {
+                    "priceChangePercent": change,
+                    "high":   high,
+                    "low":    low,
+                    "volume": volume,
+                },
+                "indicators": {
+                    "ema": {
+                        "ema9":  round(e9[-1],  6),
+                        "ema21": round(e21[-1], 6),
+                        "ema50": round(e50[-1], 6),
+                        "trend": ema_trend,
+                    },
+                    "macd": {
+                        "line":      ml,
+                        "signal":    sig,
+                        "histogram": hist,
+                        "trend":     macd_trend,
+                    },
+                    "rsi": {
+                        "value":  rsi_val,
+                        "signal": rsi_sig,
+                    },
+                    "bollingerBands": {
+                        "upper":    bb_up,
+                        "middle":   bb_mid,
+                        "lower":    bb_lo,
+                        "position": bb_pos,
+                    },
+                    "sar": {
+                        "value": sar_val,
+                        "trend": sar_trend,
+                    },
+                },
+                "supportResistance": {
+                    "support":    sup,
+                    "resistance": res,
+                },
+                "priceAction": {
+                    "pattern":  pa_pattern,
+                    "trend":    pa_trend,
+                    "strength": strength,
+                },
+                "volume": {
+                    "signal": vol_sig,
+                    "ratio":  vol_ratio,
+                },
+                "marketDepth": {
+                    "marketPressure": pressure,
+                    "imbalance":      f"{imb:+.2f}%",
+                    "bidAskRatio":    str(ratio),
+                    "bids": {
+                        "totalVolume": bid_vol,
+                        "totalValue":  bid_val,
+                        "largestWall": {
+                            "price":    lbid[0],
+                            "quantity": lbid[1],
+                            "total":    lbid[0] * lbid[1],
+                        },
+                    },
+                    "asks": {
+                        "totalVolume": ask_vol,
+                        "totalValue":  ask_val,
+                        "largestWall": {
+                            "price":    lask[0],
+                            "quantity": lask[1],
+                            "total":    lask[0] * lask[1],
+                        },
+                    },
+                    "spread": {
+                        "price":      round(spread_p, 6),
+                        "percentage": f"{round(spread_p/price*100, 4)}%",
+                    },
+                },
+                "whaleActivity": {
+                    "detected":   bool(w_bids or w_asks),
+                    "threshold":  whale_thresh,
+                    "whale_bids": w_bids[:5],
+                    "whale_asks": w_asks[:5],
+                    "summary": {
+                        "buyOrders":        len(w_bids),
+                        "sellOrders":       len(w_asks),
+                        "totalBuyVolume":   wb_vol,
+                        "totalSellVolume":  wa_vol,
+                        "sentiment":        w_sent,
+                        "netVolume":        wb_vol - wa_vol,
+                    },
+                },
+            },
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def fetch_crypto_data(symbol: str, interval: str = "1h") -> dict:
+    """
+    Try Binance Futures direct first.
+    If blocked or failed → fallback to Vercel proxy.
+    """
+    # Step 1: Try Binance direct
+    result = fetch_from_binance_direct(symbol, interval)
+    if result.get("success"):
+        return result
+
+    # Step 2: Fallback to Vercel proxy
     try:
         r = requests.get(
             f"{BINANCE_API_URL}?symbol={symbol}&interval={interval}&depth=50",
@@ -128,6 +455,7 @@ def get_current_price(symbol: str) -> float:
     if data.get("success"):
         return data["data"]["price"]["current"]
     return 0.0
+
 
 
 # ============================================================
